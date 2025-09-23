@@ -1,0 +1,1057 @@
+// ===================================================================================
+// 矿区生命周期分类与开采强度变化交互式分析工具
+// —— 修复：避免 ee.Algorithms.Not / IsEqual；用“mean+count”稳健判空
+// —— 稳健点：端点合成始终返回 ee.Image；统一缩放；BNNC/BNEC 直接返回数值
+// —— NDVI：使用 Landsat 年最大 NDVI (30m, 1986-2024) 并完成条带修复
+// ===================================================================================
+
+// ----------------------------- 全局设置 -----------------------------
+var mineAreas = ee.FeatureCollection('users/Loki_ChinaMiningResearch/ChinaMiningPolygen');
+
+var CONFIG = {
+  startYear: 1986,
+  endYear: 2024,
+  growingSeasonStart: 4,
+  growingSeasonEnd: 10
+};
+
+var analysisYears = ee.List.sequence(CONFIG.startYear, CONFIG.endYear);
+
+// Sentinel-2（用于 2023 端点）
+var s2Raw = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var s2Collection = s2Raw.select(['B4', 'B8', 'SCL']);
+
+// Landsat L2（用于起始端点 & 年最大 NDVI）
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .select(['SR_B4', 'SR_B5', 'QA_PIXEL'], ['RED', 'NIR', 'QA_PIXEL']);
+var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+  .select(['SR_B3', 'SR_B4', 'QA_PIXEL'], ['RED', 'NIR', 'QA_PIXEL']);
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .select(['SR_B3', 'SR_B4', 'QA_PIXEL'], ['RED', 'NIR', 'QA_PIXEL']);
+
+var landsatAll = ee.ImageCollection(l5.merge(l7).merge(l8));
+
+// ----------------------------- 地图可视 -----------------------------
+Map.addLayer(mineAreas, { color: 'Yellow' }, '所有矿区');
+Map.centerObject(mineAreas.first(), 7);
+
+// ----------------------------- UI -----------------------------
+var mainPanel = ui.Panel({ style: { width: '420px', padding: '10px' } });
+ui.root.add(mainPanel);
+mainPanel.add(ui.Label({
+  value: '矿区生命周期与强度变化分析',
+  style: { fontWeight: 'bold', fontSize: '20px', margin: '0 0 10px 0' }
+}));
+var tip = ui.Label('请点击地图上的黄色矿区进行分析。');
+mainPanel.add(tip);
+var datasetInfo = ui.Label(
+  'NDVI 数据说明：\n' +
+  '• 通过 GEE 去云、去云影、条带修复获得，空间分辨率 30 米。\n' +
+  '• 1986-2011 年使用 Landsat 5 年最大 NDVI，2000-2003 年限制在 4-10 月生长季以规避异常影像。\n' +
+  '• 2012 年使用 Landsat 7，针对 SLC-Off 条带进行邻域填补修复。\n' +
+  '• 2013-2024 年使用 Landsat 8，若存在条状色差属于不同日期影像所致但取值准确。',
+  { whiteSpace: 'pre-wrap', fontSize: '11px', color: '#555', margin: '6px 0 10px 0' }
+);
+mainPanel.add(datasetInfo);
+var imagerySelectionInfo = ui.Label(
+  '遥感影像选择说明：\n' +
+  '• 生命周期判定使用 1986-2024 年的 Landsat 年最大 NDVI 序列，与上文数据处理一致。\n' +
+  '• 开采强度对比的起始年份默认采用 Landsat 影像（1986-2014），并根据年份自动选择 L5/L7/L8。\n' +
+  '• 若起止年份在 2015 年及之后，则使用 Sentinel-2 SR 影像以获得更高时间分辨率。\n' +
+  '• 起止年份影像均执行统一的去云/去云影及条带修复流程，确保指数计算的一致性。',
+  { whiteSpace: 'pre-wrap', fontSize: '11px', color: '#555', margin: '0 0 10px 0' }
+);
+mainPanel.add(imagerySelectionInfo);
+var resultsPanel = ui.Panel();
+mainPanel.add(resultsPanel);
+
+// ----------------------------- 工具函数 -----------------------------
+var getPlatformByYear = function(year) {
+  year = ee.Number(year);
+  return ee.String(ee.Algorithms.If(
+    year.lte(2011),
+    'L5',
+    ee.Algorithms.If(year.eq(2012), 'L7', 'L8')
+  ));
+};
+
+var getCollectionByPlatform = function(platform) {
+  platform = ee.String(platform);
+  return ee.ImageCollection(ee.Algorithms.If(
+    platform.compareTo('L5').eq(0),
+    l5,
+    ee.Algorithms.If(platform.compareTo('L7').eq(0), l7, l8)
+  ));
+};
+
+var universalCloudMask = function(image, satellite) {
+  image = ee.Image(image);
+  if (satellite === 'Sentinel-2') {
+    var keep = [2, 4, 5, 6, 7, 11];
+    var mask = image.select('SCL').remap(keep, ee.List.repeat(1, keep.length), 0);
+    return image.updateMask(mask).select(['B4', 'B8']);
+  } else {
+    var qa = image.select('QA_PIXEL');
+    var cloudShadow = 1 << 4;
+    var cloud = 1 << 3;
+    var dilated = 1 << 1;
+    var cirrus = 1 << 2;
+    var snow = 1 << 5;
+    var mask = qa.bitwiseAnd(cloudShadow).eq(0)
+      .and(qa.bitwiseAnd(cloud).eq(0))
+      .and(qa.bitwiseAnd(dilated).eq(0))
+      .and(qa.bitwiseAnd(cirrus).eq(0))
+      .and(qa.bitwiseAnd(snow).eq(0));
+    return image.updateMask(mask).select(['RED', 'NIR', 'QA_PIXEL']).select(['RED', 'NIR']);
+  }
+};
+
+var scaleBands = function(img, satellite) {
+  img = ee.Image(img);
+  if (satellite === 'Sentinel-2') {
+    return ee.Image.cat([
+      img.select(0).multiply(0.0001).rename('RED'),
+      img.select(1).multiply(0.0001).rename('NIR')
+    ]);
+  } else {
+    return ee.Image.cat([
+      img.select(0).multiply(0.0000275).add(-0.2).rename('RED'),
+      img.select(1).multiply(0.0000275).add(-0.2).rename('NIR')
+    ]);
+  }
+};
+
+var repairLandsatStripes = function(ndviImage, year) {
+  var ndvi = ee.Image(ndviImage);
+  var yearNum = ee.Number(year);
+  var needsWideKernel = yearNum.eq(2012);
+  var kernel = ee.Kernel.square({
+    radius: ee.Number(ee.Algorithms.If(needsWideKernel, 2, 1)),
+    units: 'pixels',
+    normalize: true
+  });
+  var filled = ndvi.focalMean({ kernel: kernel, iterations: 1 });
+  var mask = ee.Image(ee.Algorithms.If(
+    needsWideKernel,
+    ndvi.mask().focalMax({ kernel: kernel, iterations: 1 }),
+    ndvi.mask()
+  ));
+  return ndvi.unmask(filled).updateMask(mask);
+};
+
+var buildAnnualLandsatNdvi = function() {
+  var annualImages = analysisYears.map(function(year) {
+    year = ee.Number(year);
+    var start = ee.Date.fromYMD(year, 1, 1);
+    var end = start.advance(1, 'year');
+
+    var platform = getPlatformByYear(year);
+    var collection = getCollectionByPlatform(platform).filterDate(start, end);
+
+    collection = ee.ImageCollection(ee.Algorithms.If(
+      year.gte(2000).and(year.lte(2003)),
+      collection.filter(ee.Filter.calendarRange(CONFIG.growingSeasonStart, CONFIG.growingSeasonEnd, 'month')),
+      collection
+    ));
+
+    collection = collection.map(function(img) {
+      var masked = universalCloudMask(img, 'Landsat');
+      var scaled = scaleBands(masked, 'Landsat');
+      var ndvi = scaled.normalizedDifference(['NIR', 'RED']).rename('NDVI');
+      var cleaned = repairLandsatStripes(ndvi, year);
+      return cleaned.copyProperties(img, ['system:time_start']);
+    });
+
+    var composite = ee.Image(ee.Algorithms.If(
+      collection.size().gt(0),
+      ee.Image(collection.qualityMosaic('NDVI')).select('NDVI'),
+      ee.Image.constant(0).rename('NDVI').updateMask(ee.Image.constant(0))
+    ));
+
+    var source = ee.String(ee.Algorithms.If(
+      platform.compareTo('L5').eq(0),
+      'Landsat 5 (TOA)',
+      ee.Algorithms.If(
+        platform.compareTo('L7').eq(0),
+        'Landsat 7 (TOA, gap-filled)',
+        'Landsat 8 (TOA)'
+      )
+    ));
+
+    return composite.set({
+      'year': year,
+      'system:time_start': start.millis(),
+      'system:time_end': end.millis(),
+      'source': source
+    });
+  });
+
+  return ee.ImageCollection(annualImages);
+};
+
+var landsatAnnualNdvi = buildAnnualLandsatNdvi();
+
+var getComposite = function(year, satellite, collection, geom) {
+  var startDate = ee.Date.fromYMD(year - 2, 1, 1);
+  var endDate = ee.Date.fromYMD(year + 2, 12, 31);
+  var selBands = (satellite === 'Sentinel-2') ? ['B4', 'B8', 'SCL'] : ['RED', 'NIR', 'QA_PIXEL'];
+
+  var masked = collection.filterBounds(geom.buffer(10000)).filterDate(startDate, endDate)
+    .select(selBands)
+    .map(function(img) { return universalCloudMask(img, satellite); });
+
+  var wider = collection.filterBounds(geom.buffer(20000))
+    .filterDate(ee.Date.fromYMD(year - 3, 1, 1), ee.Date.fromYMD(year + 3, 12, 31))
+    .select(selBands)
+    .map(function(img) { return universalCloudMask(img, satellite); });
+
+  var loose = collection.filterBounds(geom.buffer(20000))
+    .filterDate(ee.Date.fromYMD(year - 3, 1, 1), ee.Date.fromYMD(year + 3, 12, 31))
+    .select(selBands)
+    .map(function(img) {
+      return (satellite === 'Sentinel-2')
+        ? ee.Image(img).select(['B4', 'B8'])
+        : ee.Image(img).select(['RED', 'NIR']);
+    });
+
+  var empty = (satellite === 'Sentinel-2')
+    ? ee.Image.constant([0, 0]).rename(['B4', 'B8'])
+    : ee.Image.constant([0, 0]).rename(['RED', 'NIR']);
+
+  var img = ee.Algorithms.If(
+    masked.size().gt(3), masked.mean().select(empty.bandNames()),
+    ee.Algorithms.If(
+      wider.size().gt(3), wider.mean().select(empty.bandNames()),
+      ee.Algorithms.If(
+        loose.size().gt(1), loose.mean().select(empty.bandNames()),
+        empty
+      )
+    )
+  );
+  return ee.Image(img).clip(geom.buffer(12000));
+};
+
+var scaleForPlatform = function(img, satellite) {
+  return scaleBands(img, satellite);
+};
+
+var robustMean = function(img, bandName, geom, scale) {
+  var reducer = ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.count(), sharedInputs: true
+  });
+  var statsMasked = ee.Dictionary(
+    ee.Image(img.select(bandName)).reduceRegion({
+      reducer: reducer, geometry: geom, scale: scale, maxPixels: 1e9, bestEffort: true
+    })
+  );
+  var meanMasked = ee.Number(statsMasked.get(bandName + '_mean'));
+  var countMasked = ee.Number(statsMasked.get(bandName + '_count'));
+  var meanLoose = ee.Number(
+    ee.Image(img.select(bandName)).unmask(0).reduceRegion({
+      reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e9, bestEffort: true
+    }).get(bandName)
+  );
+  return ee.Number(ee.Algorithms.If(countMasked.gt(0), meanMasked, meanLoose));
+};
+
+var calcBNNC_BNEC = function(image, satellite, geom, ring) {
+  var scale = (satellite === 'Sentinel-2' ? 10 : 30);
+  var scaled = scaleForPlatform(image, satellite);
+  var RED = scaled.select('RED');
+  var NIR = scaled.select('NIR');
+
+  var ndvi = NIR.subtract(RED).divide(NIR.add(RED).add(1e-6)).rename('NDVI');
+
+  var ndvi_in = robustMean(ndvi, 'NDVI', geom, scale);
+  var ndvi_out = robustMean(ndvi, 'NDVI', ring, scale);
+  var bnnc = ee.Number(ee.Algorithms.If(ndvi_out.abs().gt(1e-12),
+    ndvi_out.subtract(ndvi_in).divide(ndvi_out), null));
+
+  var nirByte = NIR.clamp(0, 1).multiply(255).toByte();
+  var texture = nirByte.glcmTexture({ size: 2, average: true });
+  var entropyBand = 'NIR_ent';
+  var entropy = texture.select(entropyBand);
+
+  var ent_in = robustMean(entropy, entropyBand, geom, scale);
+  var ent_out = robustMean(entropy, entropyBand, ring, scale);
+  var bnec = ee.Number(ee.Algorithms.If(ent_out.abs().gt(1e-12),
+    ent_out.subtract(ent_in).divide(ent_out), null));
+
+  return ee.Dictionary({
+    bnnc_in: ndvi_in, bnnc_out: ndvi_out, bnnc: bnnc,
+    bnec_in: ent_in, bnec_out: ent_out, bnec: bnec
+  });
+};
+
+// ----------------------------- 主分析流程 -----------------------------
+var analyzeMine = function(selectedMine) {
+  selectedMine = ee.Feature(selectedMine);
+
+  var toRemove = [];
+  for (var i = 0; i < Map.layers().length(); i++) {
+    var lyr = Map.layers().get(i);
+    if (lyr.getName() === '选中的矿区') toRemove.push(lyr);
+  }
+  toRemove.forEach(function(lyr) { Map.remove(lyr); });
+  Map.addLayer(selectedMine, { color: 'Red' }, '选中的矿区');
+
+  var geom = selectedMine.geometry().simplify(100);
+
+  resultsPanel.clear();
+  var classificationLabel = ui.Label('1. 正在进行生命周期分类...');
+  var chartPanel = ui.Panel();
+  var intensityPanel = ui.Panel();
+  var startExplainLabel = ui.Label('', { whiteSpace: 'pre-wrap', color: '#8a6d3b', fontSize: '11px', margin: '4px 0 0 0' });
+  var stopExplainLabel = ui.Label('', { whiteSpace: 'pre-wrap', color: '#8a6d3b', fontSize: '11px', margin: '0 0 6px 0' });
+  resultsPanel.add(classificationLabel)
+    .add(startExplainLabel)
+    .add(stopExplainLabel)
+    .add(chartPanel)
+    .add(intensityPanel);
+
+  var annualNdvi = ee.FeatureCollection(
+    landsatAnnualNdvi.toList(landsatAnnualNdvi.size()).map(function(img) {
+      img = ee.Image(img);
+      var year = ee.Number(img.get('year'));
+      var meanNdvi = img.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: geom,
+        scale: 30,
+        maxPixels: 1e9,
+        bestEffort: true
+      }).get('NDVI');
+      return ee.Feature(null, {
+        'year': year,
+        'annual_max_ndvi': meanNdvi,
+        'source': img.get('source')
+      });
+    })
+  ).filter(ee.Filter.notNull(['annual_max_ndvi'])).sort('year');
+
+  annualNdvi.evaluate(function(fc, error) {
+    if (error || !fc || fc.features.length < 5) {
+      resultsPanel.clear();
+      resultsPanel.add(ui.Label('数据不足或计算错误，无法进行分析。'));
+      return;
+    }
+
+    var rawData = fc.features.map(function(f) {
+      return {
+        year: f.properties.year,
+        ndvi: f.properties.annual_max_ndvi,
+        source: f.properties.source
+      };
+    }).sort(function(a, b) { return a.year - b.year; });
+
+    var computeSlope = function(points) {
+      if (!points || points.length < 2) {
+        return 0;
+      }
+      var n = points.length;
+      var sumX = 0;
+      var sumY = 0;
+      var sumXY = 0;
+      var sumXX = 0;
+      for (var i = 0; i < n; i++) {
+        var x = points[i].year;
+        var y = points[i].ndvi;
+        sumX += x;
+        sumY += y;
+        sumXY += x * y;
+        sumXX += x * x;
+      }
+      var denom = n * sumXX - sumX * sumX;
+      if (Math.abs(denom) < 1e-9) {
+        return 0;
+      }
+      return (n * sumXY - sumX * sumY) / denom;
+    };
+
+    function medianValue(values) {
+      if (!values || values.length === 0) { return 0; }
+      var sorted = values.slice().sort(function(a, b) { return a - b; });
+      var mid = Math.floor(sorted.length / 2);
+      if (sorted.length % 2 === 0) {
+        return (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+      return sorted[mid];
+    }
+
+    function removeOutliers(points) {
+      if (!points || points.length === 0) { return []; }
+      var cleaned = points.map(function(pt) {
+        return { year: pt.year, ndvi: pt.ndvi, source: pt.source };
+      });
+      if (cleaned.length < 3) {
+        return cleaned;
+      }
+      var originalValues = cleaned.map(function(pt) { return pt.ndvi; });
+      var globalMedian = medianValue(originalValues);
+      var deviations = originalValues.map(function(val) { return Math.abs(val - globalMedian); });
+      var mad = medianValue(deviations);
+      var threshold = Math.max(0.12, (mad || 0) * 3);
+      for (var idx = 0; idx < cleaned.length; idx++) {
+        var val = originalValues[idx];
+        if (Math.abs(val - globalMedian) > threshold) {
+          var neighbors = [];
+          if (idx > 0) { neighbors.push(originalValues[idx - 1]); }
+          if (idx < originalValues.length - 1) { neighbors.push(originalValues[idx + 1]); }
+          var neighborMean = neighbors.length > 0
+            ? neighbors.reduce(function(acc, cur) { return acc + cur; }, 0) / neighbors.length
+            : globalMedian;
+          cleaned[idx].ndvi = (neighborMean * 0.7) + (globalMedian * 0.3);
+        }
+      }
+      return cleaned;
+    }
+
+    function smoothValues(points, window) {
+      if (!points || points.length === 0) { return []; }
+      if (points.length === 1) { return [points[0].ndvi]; }
+      var w = Math.max(2, Math.min(window || 3, points.length));
+      var half = Math.floor(w / 2);
+      var smoothed = [];
+      for (var idx = 0; idx < points.length; idx++) {
+        var sum = 0;
+        var count = 0;
+        for (var offset = -half; offset <= half; offset++) {
+          var neighbor = idx + offset;
+          if (neighbor >= 0 && neighbor < points.length) {
+            sum += points[neighbor].ndvi;
+            count++;
+          }
+        }
+        smoothed.push(sum / count);
+      }
+      return smoothed;
+    }
+
+    function pointsWithValues(points, values) {
+      if (!points || !values || points.length !== values.length) { return []; }
+      var updated = [];
+      for (var idx = 0; idx < points.length; idx++) {
+        updated.push({ year: points[idx].year, ndvi: values[idx] });
+      }
+      return updated;
+    }
+
+    function analyzeContinuity(points, direction, tolerance) {
+      if (!points || points.length < 2) {
+        return { ratio: 0, reversals: 0 };
+      }
+      var down = direction === 'down';
+      var forward = 0;
+      var reversals = 0;
+      for (var idx = 1; idx < points.length; idx++) {
+        var diff = points[idx].ndvi - points[idx - 1].ndvi;
+        if (down) {
+          if (diff <= -tolerance) {
+            forward++;
+          } else if (diff >= tolerance) {
+            reversals++;
+          }
+        } else {
+          if (diff >= tolerance) {
+            forward++;
+          } else if (diff <= -tolerance) {
+            reversals++;
+          }
+        }
+      }
+      var ratio = forward / Math.max(1, points.length - 1);
+      return { ratio: ratio, reversals: reversals };
+    }
+
+    var cleanedData = removeOutliers(rawData);
+    var smoothedValuesGlobal = smoothValues(cleanedData, 5);
+    var smoothedSeries = pointsWithValues(cleanedData, smoothedValuesGlobal);
+    var data = cleanedData;
+
+    var ndviValues = data.map(function(d) { return d.ndvi; });
+    var rawValues = rawData.map(function(d) { return d.ndvi; });
+    var firstThreeAvg = (ndviValues[0] + ndviValues[1] + ndviValues[2]) / 3;
+    var lastThreeAvg = (ndviValues[ndviValues.length - 1] + ndviValues[ndviValues.length - 2] + ndviValues[ndviValues.length - 3]) / 3;
+    var maxNdviClean = Math.max.apply(null, ndviValues);
+    var minNdviClean = Math.min.apply(null, ndviValues);
+    var maxNdviRaw = Math.max.apply(null, rawValues);
+    var overallSlope = computeSlope(smoothedSeries);
+
+    var sortedNdvi = ndviValues.slice().sort(function(a, b) { return a - b; });
+    var medianNdvi;
+    if (sortedNdvi.length % 2 === 0) {
+      var midUpper = sortedNdvi.length / 2;
+      medianNdvi = (sortedNdvi[midUpper - 1] + sortedNdvi[midUpper]) / 2;
+    } else {
+      medianNdvi = sortedNdvi[Math.floor(sortedNdvi.length / 2)];
+    }
+    var baselineMean = (firstThreeAvg + lastThreeAvg) / 2;
+    var spikeThreshold = baselineMean + 0.18;
+    var highSpikeCount = rawData.filter(function(item) { return item.ndvi > spikeThreshold; }).length;
+
+    var mainCategory = 'A 类';
+    var mainDesc = '历史遗留矿区';
+    var subCategory = '';
+    var startYearVal = null;
+    var startYearDisplay = '未识别';
+    var startIndex = -1;
+    var startTag = 'unknown';
+    var stopYearVal = null;
+    var stopYearDisplay = '未识别';
+    var startDiagnostics = [];
+    var stopDiagnostics = [];
+
+    var nearlyFlat = Math.abs(overallSlope) < 0.0015 && Math.abs(ndviValues[ndviValues.length - 1] - ndviValues[0]) < 0.05;
+    var persistentlyLow = firstThreeAvg < 0.2 && lastThreeAvg < 0.2 && maxNdviClean < 0.3 && (maxNdviClean - minNdviClean) < 0.1;
+    var lowFlatWithSpikes = firstThreeAvg < 0.22 && lastThreeAvg < 0.22 && nearlyFlat &&
+      (maxNdviRaw - medianNdvi > 0.2) && (medianNdvi - minNdviClean < 0.08) && highSpikeCount <= 3;
+
+    var meanPoints = function(points) {
+      if (!points || points.length === 0) { return null; }
+      var total = 0;
+      for (var idx = 0; idx < points.length; idx++) {
+        total += points[idx].ndvi;
+      }
+      return total / points.length;
+    };
+
+    var minPoints = function(points) {
+      if (!points || points.length === 0) { return null; }
+      var min = points[0].ndvi;
+      for (var idx = 1; idx < points.length; idx++) {
+        if (points[idx].ndvi < min) {
+          min = points[idx].ndvi;
+        }
+      }
+      return min;
+    };
+
+    var maxPoints = function(points) {
+      if (!points || points.length === 0) { return null; }
+      var max = points[0].ndvi;
+      for (var idx = 1; idx < points.length; idx++) {
+        if (points[idx].ndvi > max) {
+          max = points[idx].ndvi;
+        }
+      }
+      return max;
+    };
+
+    var evaluateStartCandidate = function(series, index) {
+      var preWindow = series.slice(Math.max(0, index - 5), index + 1);
+      var postWindow = series.slice(index + 1, Math.min(series.length, index + 8));
+      var reasons = [];
+      if (preWindow.length < 3 || postWindow.length < 4) {
+        reasons.push('候选年份两侧可用年份不足');
+        return { pass: false, reasons: reasons };
+      }
+      var preAvg = meanPoints(preWindow);
+      var postAvg = meanPoints(postWindow);
+      var drop = preAvg - postAvg;
+      var relDrop = drop / Math.max(0.01, preAvg);
+      var postSlope = computeSlope(postWindow);
+      var midWindow = series.slice(index, Math.min(series.length, index + 6));
+      var midSlope = computeSlope(midWindow);
+      var postMin = minPoints(postWindow);
+      var tail = postWindow.slice(-3);
+      var tailAvg = tail.length > 0 ? meanPoints(tail) : postAvg;
+      var continuity = analyzeContinuity(postWindow, 'down', 0.0025);
+      var netChange = postWindow[postWindow.length - 1].ndvi - postWindow[0].ndvi;
+
+      if (drop < 0.03 && relDrop < 0.15) {
+        reasons.push('下降幅度不足（均值差 ' + drop.toFixed(3) + '）');
+      }
+      if (postSlope > -0.0004) {
+        reasons.push('下降阶段整体斜率过缓（' + postSlope.toFixed(4) + '）');
+      }
+      if (midSlope > -0.0003) {
+        reasons.push('拐点附近未见持续下降趋势');
+      }
+      if (postMin > preAvg - Math.max(0.025, drop * 0.55)) {
+        reasons.push('下降后 NDVI 未保持低位');
+      }
+      if (tailAvg > preAvg - Math.max(0.03, drop * 0.6)) {
+        reasons.push('下降末端均值回升过快');
+      }
+      if (continuity.ratio < 0.55 || continuity.reversals > 1) {
+        reasons.push('下降阶段存在明显反弹');
+      }
+      if (netChange > -0.02) {
+        reasons.push('下降阶段净变化不足');
+      }
+
+      var pass = reasons.length === 0;
+      return {
+        pass: pass,
+        reasons: reasons,
+        metrics: {
+          preAvg: preAvg,
+          postAvg: postAvg,
+          drop: drop,
+          relDrop: relDrop,
+          postSlope: postSlope,
+          continuity: continuity.ratio
+        }
+      };
+    };
+
+    var evaluateStopCandidate = function(series, index) {
+      var preWindow = series.slice(Math.max(0, index - 5), index + 1);
+      var postWindow = series.slice(index + 1, Math.min(series.length, index + 8));
+      var reasons = [];
+      if (preWindow.length < 3 || postWindow.length < 4) {
+        reasons.push('候选年份两侧可用年份不足');
+        return { pass: false, reasons: reasons };
+      }
+      var preAvg = meanPoints(preWindow);
+      var postAvg = meanPoints(postWindow);
+      var rise = postAvg - preAvg;
+      var relRise = rise / Math.max(0.01, Math.abs(preAvg));
+      var postSlope = computeSlope(postWindow);
+      var postMax = maxPoints(postWindow);
+      var tail = postWindow.slice(-3);
+      var tailAvg = tail.length > 0 ? meanPoints(tail) : postAvg;
+      var continuity = analyzeContinuity(postWindow, 'up', 0.0025);
+      var netChange = postWindow[postWindow.length - 1].ndvi - postWindow[0].ndvi;
+
+      if (rise < 0.03 && relRise < 0.15) {
+        reasons.push('上升幅度不足（均值差 ' + rise.toFixed(3) + '）');
+      }
+      if (postSlope < 0.0004) {
+        reasons.push('恢复阶段整体斜率过缓（' + postSlope.toFixed(4) + '）');
+      }
+      if (postMax < preAvg + Math.max(0.03, rise * 0.6)) {
+        reasons.push('恢复峰值不足以脱离低谷');
+      }
+      if (tailAvg < preAvg + Math.max(0.025, rise * 0.6)) {
+        reasons.push('恢复末端均值尚未明显抬升');
+      }
+      if (continuity.ratio < 0.55 || continuity.reversals > 1) {
+        reasons.push('恢复阶段存在明显下滑');
+      }
+      if (netChange < 0.02) {
+        reasons.push('恢复阶段净变化不足');
+      }
+
+      var pass = reasons.length === 0;
+      return {
+        pass: pass,
+        reasons: reasons,
+        metrics: {
+          preAvg: preAvg,
+          postAvg: postAvg,
+          rise: rise,
+          relRise: relRise,
+          postSlope: postSlope,
+          continuity: continuity.ratio
+        }
+      };
+    };
+
+    var pickBestDiagnostic = function(diags, metricName) {
+      if (!diags || diags.length === 0) { return null; }
+      var best = diags[0];
+      for (var idx = 1; idx < diags.length; idx++) {
+        var cand = diags[idx];
+        var candMetric = (cand && typeof cand[metricName] === 'number') ? cand[metricName] : (cand && cand.metrics ? cand.metrics[metricName] : null);
+        var bestMetric = (best && typeof best[metricName] === 'number') ? best[metricName] : (best && best.metrics ? best.metrics[metricName] : null);
+        if (candMetric !== null && candMetric !== undefined) {
+          if (bestMetric === null || bestMetric === undefined || candMetric > bestMetric) {
+            best = cand;
+          }
+        }
+      }
+      return best;
+    };
+
+    var joinReasons = function(reasons) {
+      if (!reasons || reasons.length === 0) { return '未满足连续趋势条件'; }
+      var unique = [];
+      for (var idx = 0; idx < reasons.length; idx++) {
+        if (unique.indexOf(reasons[idx]) === -1) {
+          unique.push(reasons[idx]);
+        }
+      }
+      return unique.join('；');
+    };
+
+    if ((persistentlyLow && nearlyFlat) || lowFlatWithSpikes) {
+      mainCategory = 'A 类';
+      mainDesc = '历史遗留矿区';
+      startYearDisplay = '1986年之前';
+      startTag = 'pre1986';
+    } else {
+      for (var j = 2; j < smoothedSeries.length - 5; j++) {
+        var prevAvg = (smoothedSeries[j - 1].ndvi + smoothedSeries[j - 2].ndvi) / 2;
+        var nextAvg = (smoothedSeries[j + 1].ndvi + smoothedSeries[j + 2].ndvi) / 2;
+        var candidatePeak = smoothedSeries[j].ndvi;
+        var isPeak = candidatePeak >= prevAvg && candidatePeak >= nextAvg;
+        if (isPeak && candidatePeak >= (prevAvg - 0.01)) {
+          var evalStart = evaluateStartCandidate(smoothedSeries, j);
+          if (evalStart.pass) {
+            var actualIdx = Math.min(j + 1, smoothedSeries.length - 1);
+            startYearVal = smoothedSeries[actualIdx].year;
+            startYearDisplay = String(startYearVal);
+            startIndex = actualIdx;
+            startTag = 'detected';
+            break;
+          } else {
+            startDiagnostics.push({
+              year: smoothedSeries[j].year,
+              reasons: evalStart.reasons,
+              metrics: evalStart.metrics,
+              drop: evalStart.metrics ? evalStart.metrics.drop : null
+            });
+          }
+        }
+      }
+    }
+
+    var stopSearchStart = (startIndex >= 0) ? startIndex + 1 : 2;
+    for (var k = stopSearchStart; k < smoothedSeries.length - 4; k++) {
+      if (startYearVal !== null && smoothedSeries[k].year <= startYearVal) {
+        continue;
+      }
+      var prevMean = (smoothedSeries[k - 1].ndvi + smoothedSeries[k - 2].ndvi) / 2;
+      var nextMean = (smoothedSeries[k + 1].ndvi + smoothedSeries[k + 2].ndvi) / 2;
+      var candidateValley = smoothedSeries[k].ndvi;
+      var isValley = candidateValley <= prevMean && candidateValley <= nextMean;
+      if (isValley && candidateValley <= ((prevMean + nextMean) / 2 + 0.01)) {
+        var evalStop = evaluateStopCandidate(smoothedSeries, k);
+        if (evalStop.pass) {
+          stopYearVal = smoothedSeries[k].year;
+          stopYearDisplay = String(stopYearVal);
+          break;
+        } else {
+          stopDiagnostics.push({
+            year: smoothedSeries[k].year,
+            reasons: evalStop.reasons,
+            metrics: evalStop.metrics,
+            rise: evalStop.metrics ? evalStop.metrics.rise : null
+          });
+        }
+      }
+    }
+
+    if (startTag === 'pre1986') {
+      mainCategory = 'A 类';
+      mainDesc = '历史遗留矿区';
+      if (stopYearVal === null) {
+        stopYearDisplay = '未识别（长期低位）';
+      } else if (stopYearVal >= 2000) {
+        stopYearDisplay = stopYearDisplay + '（晚期恢复）';
+      }
+    } else if (startYearVal !== null) {
+      if (startYearVal < 2000) {
+        mainCategory = 'A 类';
+        mainDesc = '历史遗留矿区';
+        if (stopYearVal !== null && stopYearVal >= 2000) {
+          stopYearDisplay = stopYearDisplay + '（恢复延续至 2000 年后）';
+        } else if (stopYearVal === null) {
+          stopYearDisplay = '未识别（使用2023年作为基准）';
+        }
+      } else {
+        mainCategory = 'B 类';
+        mainDesc = '本世纪开采矿区';
+        if (stopYearVal !== null && stopYearVal >= 2000 && stopYearVal > startYearVal) {
+          subCategory = 'B2 开采不活跃矿区';
+        } else {
+          subCategory = 'B1 开采活跃矿区';
+          if (stopYearVal === null) {
+            stopYearDisplay = '未识别（持续扰动，使用2023年作为基准）';
+          } else if (stopYearVal <= startYearVal) {
+            stopYearDisplay = stopYearDisplay + '（早于或等于起始年份，可能存在异常）';
+          } else if (stopYearVal < 2000) {
+            stopYearDisplay = stopYearDisplay + '（异常：早于 2000 年）';
+          }
+        }
+      }
+    } else {
+      if (nearlyFlat && lastThreeAvg < 0.24 && firstThreeAvg < 0.24) {
+        mainCategory = 'A 类';
+        mainDesc = '历史遗留矿区';
+        startYearDisplay = '1986年之前（趋势平缓）';
+        startTag = 'pre1986';
+        if (stopYearVal === null) {
+          stopYearDisplay = '未识别（长期低位）';
+        }
+      } else {
+        mainCategory = 'B 类';
+        mainDesc = '本世纪开采矿区';
+        if (overallSlope >= 0.0015 || lastThreeAvg - firstThreeAvg >= 0.05) {
+          subCategory = 'B2 开采不活跃矿区（趋势恢复）';
+        } else {
+          subCategory = 'B1 开采活跃矿区（起始年份未识别）';
+        }
+        startYearDisplay = '未识别（使用1986年作为基准）';
+        if (stopYearVal === null) {
+          stopYearDisplay = '未识别（使用2023年作为基准）';
+        }
+      }
+    }
+
+    var startExplanationText = '';
+    if (startTag === 'pre1986') {
+      startExplanationText = '开采起始年份判定说明：NDVI 自 1986 年序列开始即长期处于低位且缺乏明显下降阶段，因此判断为 1986 年之前已开采。';
+    } else if (startYearVal !== null) {
+      startExplanationText = '开采起始年份判定说明：' + startYearVal + ' 年之后 NDVI 持续下滑并维持在较低水平，满足连续下降的要求。';
+    } else {
+      var bestStartDiag = pickBestDiagnostic(startDiagnostics, 'drop');
+      if (bestStartDiag) {
+        startExplanationText = '开采起始年份判定说明：' + bestStartDiag.year + ' 年附近的候选拐点未通过判定，主要原因是 ' + joinReasons(bestStartDiag.reasons) + '。';
+      } else {
+        startExplanationText = '开采起始年份判定说明：未找到满足连续下降与幅度要求的拐点，整体 NDVI 波动较小或一直维持低位。';
+      }
+    }
+
+    var stopExplanationText = '';
+    if (stopYearVal !== null) {
+      stopExplanationText = '停止剧烈开采年份判定说明：' + stopYearVal + ' 年之后 NDVI 出现持续回升并保持增长趋势，符合恢复判断标准。';
+    } else {
+      var bestStopDiag = pickBestDiagnostic(stopDiagnostics, 'rise');
+      if (bestStopDiag) {
+        stopExplanationText = '停止剧烈开采年份判定说明：' + bestStopDiag.year + ' 年附近的候选拐点未通过判定，主要原因是 ' + joinReasons(bestStopDiag.reasons) + '。';
+      } else if (startTag === 'pre1986') {
+        stopExplanationText = '停止剧烈开采年份判定说明：序列始终低位且未出现持续恢复趋势，暂无法确认停止年份。';
+      } else {
+        stopExplanationText = '停止剧烈开采年份判定说明：未观察到满足连续上升与幅度要求的拐点，可能仍处于扰动阶段或恢复幅度有限。';
+      }
+    }
+
+    startExplainLabel.setValue(startExplanationText);
+    stopExplainLabel.setValue(stopExplanationText);
+
+    var categoryLabel = mainCategory + ' (' + mainDesc;
+    if (mainCategory === 'B 类' && subCategory) {
+      categoryLabel += ' - ' + subCategory;
+    }
+    categoryLabel += ')';
+
+    classificationLabel.setValue('1. 生命周期分类结果: ' + categoryLabel);
+
+    var dataTable = [['Year', 'NDVI']];
+    rawData.forEach(function(d) { dataTable.push([String(d.year), d.ndvi]); });
+    var ndviChart = ui.Chart(dataTable, 'LineChart', {
+      title: 'NDVI 年最大值趋势 (1986-2024)',
+      hAxis: { title: '年份', format: '####' }, vAxis: { title: '年最大NDVI (30m)' },
+      lineWidth: 2, pointSize: 4, series: { 0: { color: 'green' } }
+    });
+    chartPanel.clear();
+    chartPanel.add(ndviChart);
+    var coverageText = '数据覆盖: ' + rawData[0].year + '-' + rawData[rawData.length - 1].year +
+      '（' + rawData[0].source + ' → ' + rawData[rawData.length - 1].source + '）';
+    chartPanel.add(ui.Label(coverageText, { fontSize: '11px', color: '#555', margin: '6px 0 0 0' }));
+
+    intensityPanel.clear();
+    intensityPanel.add(ui.Label('2. 开采强度变化分析', { fontWeight: 'bold' }));
+    intensityPanel.add(ui.Label('   开采起始年份 (基准): ' + startYearDisplay, { whiteSpace: 'pre' }));
+    intensityPanel.add(ui.Label('   停止剧烈开采年份 (基准): ' + stopYearDisplay, { whiteSpace: 'pre' }));
+
+    var miningDurationLabel = ui.Label('', { whiteSpace: 'pre' });
+    var durationText = '   剧烈开采年份跨度: 年份未识别';
+    if (startTag === 'pre1986') {
+      durationText = '   剧烈开采年份跨度: 1986年之前已处于剧烈开采阶段';
+    } else if (startYearVal !== null && stopYearVal !== null) {
+      if (stopYearVal > startYearVal) {
+        durationText = '   剧烈开采年份跨度（' + startYearVal + '-' + stopYearVal + '）: ' +
+          (stopYearVal - startYearVal) + ' 年';
+      } else {
+        durationText = '   剧烈开采年份跨度（' + startYearVal + '-' + stopYearVal + '）: 停止年份不晚于起始年份';
+      }
+    }
+    miningDurationLabel.setValue(durationText);
+    intensityPanel.add(miningDurationLabel);
+
+    intensityPanel.add(ui.Label('   注: 若年份未识别，则采用1986年与2023年作为BNNC/BNEC计算的基准年份。', {
+      whiteSpace: 'pre', color: '#666'
+    }));
+
+    var intensityStartYear = (startYearVal !== null) ? startYearVal : CONFIG.startYear;
+    var fallbackStopYear = 2023;
+    var intensityStopYear = (stopYearVal !== null) ? stopYearVal : fallbackStopYear;
+    var latestReferenceYear = 2023;
+
+    var resolveSatellite = function(year) {
+      return year >= 2015 ? 'Sentinel-2' : 'Landsat';
+    };
+
+    var resolveCollection = function(year) {
+      return year >= 2015 ? s2Collection : landsatAll;
+    };
+
+    var startSatellite = resolveSatellite(intensityStartYear);
+    var endSatellite = resolveSatellite(intensityStopYear);
+    var latestSatellite = resolveSatellite(latestReferenceYear);
+    var startCollection = resolveCollection(intensityStartYear);
+    var endCollection = resolveCollection(intensityStopYear);
+    var latestCollection = resolveCollection(latestReferenceYear);
+
+    var bnncStartLabel = ui.Label('   - BNNC 起始年份: 正在计算...', { whiteSpace: 'pre' });
+    var bnncEndLabel = ui.Label('   - BNNC 停止年份: 正在计算...', { whiteSpace: 'pre' });
+    var bnncLatestLabel = ui.Label('   - BNNC 2023年: 正在计算...', { whiteSpace: 'pre' });
+    var bnncChangeStopLabel = ui.Label('   - BNNC 变化率（起始-停止）: 正在计算...', { whiteSpace: 'pre' });
+    var bnncChangeLatestLabel = ui.Label('   - BNNC 变化率（起始-2023）: 正在计算...', { whiteSpace: 'pre' });
+    intensityPanel
+      .add(bnncStartLabel)
+      .add(bnncEndLabel)
+      .add(bnncLatestLabel)
+      .add(bnncChangeStopLabel)
+      .add(bnncChangeLatestLabel);
+
+    var bnecStartLabel = ui.Label('   - BNEC 起始年份: 正在计算...', { whiteSpace: 'pre' });
+    var bnecEndLabel = ui.Label('   - BNEC 停止年份: 正在计算...', { whiteSpace: 'pre' });
+    var bnecLatestLabel = ui.Label('   - BNEC 2023年: 正在计算...', { whiteSpace: 'pre' });
+    var bnecChangeStopLabel = ui.Label('   - BNEC 变化率（起始-停止）: 正在计算...', { whiteSpace: 'pre' });
+    var bnecChangeLatestLabel = ui.Label('   - BNEC 变化率（起始-2023）: 正在计算...', { whiteSpace: 'pre' });
+    intensityPanel
+      .add(bnecStartLabel)
+      .add(bnecEndLabel)
+      .add(bnecLatestLabel)
+      .add(bnecChangeStopLabel)
+      .add(bnecChangeLatestLabel);
+
+    var ring = geom.buffer(1000).difference(geom, 10);
+
+    var checkAvail = function(year, collection) {
+      var startDate = ee.Date.fromYMD(year - 2, 1, 1);
+      var endDate = ee.Date.fromYMD(year + 2, 12, 31);
+      return collection.filterBounds(geom.buffer(10000)).filterDate(startDate, endDate).size();
+    };
+
+
+    intensityPanel.add(ui.Label('   数据可用性检查:', { fontWeight: 'bold', whiteSpace: 'pre' }));
+    var startDataLabel = ui.Label('   - 起始年份 (' + intensityStartYear + ', ' + startSatellite + ') 影像数量: 正在检查...', { whiteSpace: 'pre' });
+    var endDataLabel = ui.Label('   - 停止年份 (' + intensityStopYear + ', ' + endSatellite + ') 影像数量: 正在检查...', { whiteSpace: 'pre' });
+    var latestDataLabel = ui.Label('   - 2023年 (' + latestSatellite + ') 影像数量: 正在检查...', { whiteSpace: 'pre' });
+    intensityPanel.add(startDataLabel).add(endDataLabel).add(latestDataLabel);
+
+    var startCount = checkAvail(intensityStartYear, startCollection);
+    var endCount = checkAvail(intensityStopYear, endCollection);
+    var latestCount = checkAvail(latestReferenceYear, latestCollection);
+    startCount.evaluate(function(sc) {
+      startDataLabel.setValue('   - 起始年份 (' + intensityStartYear + ', ' + startSatellite + ') 影像数量: ' + sc);
+      endCount.evaluate(function(ec) {
+        endDataLabel.setValue('   - 停止年份 (' + intensityStopYear + ', ' + endSatellite + ') 影像数量: ' + ec);
+        latestCount.evaluate(function(lc) {
+          latestDataLabel.setValue('   - 2023年 (' + latestSatellite + ') 影像数量: ' + lc);
+
+          if (sc < 1 || ec < 1 || lc < 1) {
+            intensityPanel.add(ui.Label('   数据极少，结果可能不稳定。', { color: 'orange' }));
+          }
+
+          var startComposite = getComposite(intensityStartYear, startSatellite, startCollection, geom);
+          var endComposite = getComposite(intensityStopYear, endSatellite, endCollection, geom);
+          var latestComposite = getComposite(latestReferenceYear, latestSatellite, latestCollection, geom);
+
+          var startDict = calcBNNC_BNEC(startComposite, startSatellite, geom, ring);
+          var endDict = calcBNNC_BNEC(endComposite, endSatellite, geom, ring);
+          var latestDict = calcBNNC_BNEC(latestComposite, latestSatellite, geom, ring);
+
+          ee.Dictionary({ start: startDict, end: endDict, latest: latestDict }).evaluate(function(results, err) {
+            if (err) {
+              intensityPanel.add(ui.Label('   计算错误: ' + err, { color: 'red' }));
+              return;
+            }
+            if (!results || !results.start || !results.end || !results.latest) {
+              intensityPanel.add(ui.Label('   结果为空。', { color: 'red' }));
+              return;
+            }
+
+            var bnnc_start = results.start.bnnc;
+            var bnnc_end = results.end.bnnc;
+            var bnnc_latest = results.latest.bnnc;
+            var bnec_start = results.start.bnec;
+            var bnec_end = results.end.bnec;
+            var bnec_latest = results.latest.bnec;
+
+            if (typeof bnnc_start === 'number') {
+              bnncStartLabel.setValue('   - BNNC 起始年份: ' + bnnc_start.toFixed(3));
+            } else {
+              bnncStartLabel.setValue('   - BNNC 起始年份: 数据不足');
+            }
+            if (typeof bnnc_end === 'number') {
+              bnncEndLabel.setValue('   - BNNC 停止年份: ' + bnnc_end.toFixed(3));
+            } else {
+              bnncEndLabel.setValue('   - BNNC 停止年份: 数据不足');
+            }
+            if (typeof bnnc_latest === 'number') {
+              bnncLatestLabel.setValue('   - BNNC 2023年: ' + bnnc_latest.toFixed(3));
+            } else {
+              bnncLatestLabel.setValue('   - BNNC 2023年: 数据不足');
+            }
+
+            var startYearLabel = intensityStartYear;
+            var stopYearLabel = stopYearVal !== null ? intensityStopYear : null;
+
+            if (typeof bnnc_start === 'number' && typeof bnnc_end === 'number' && Math.abs(bnnc_start) > 1e-6 && stopYearLabel !== null) {
+              var bnnc_change_stop = (bnnc_end - bnnc_start) / Math.abs(bnnc_start);
+              bnncChangeStopLabel.setValue('   - BNNC 变化率（' + startYearLabel + '-' + stopYearLabel + '）: ' + bnnc_change_stop.toFixed(2));
+            } else if (stopYearLabel === null) {
+              bnncChangeStopLabel.setValue('   - BNNC 变化率（起始-停止）: 停止年份未识别');
+            } else {
+              bnncChangeStopLabel.setValue('   - BNNC 变化率（' + startYearLabel + '-' + stopYearLabel + '）: 无法计算');
+            }
+
+            if (typeof bnnc_start === 'number' && typeof bnnc_latest === 'number' && Math.abs(bnnc_start) > 1e-6) {
+              var bnnc_change_latest = (bnnc_latest - bnnc_start) / Math.abs(bnnc_start);
+              bnncChangeLatestLabel.setValue('   - BNNC 变化率（' + startYearLabel + '-' + latestReferenceYear + '）: ' + bnnc_change_latest.toFixed(2));
+            } else {
+              bnncChangeLatestLabel.setValue('   - BNNC 变化率（' + startYearLabel + '-' + latestReferenceYear + '）: 无法计算');
+            }
+
+            if (typeof bnec_start === 'number') {
+              bnecStartLabel.setValue('   - BNEC 起始年份: ' + bnec_start.toFixed(3));
+            } else {
+              bnecStartLabel.setValue('   - BNEC 起始年份: 数据不足');
+            }
+            if (typeof bnec_end === 'number') {
+              bnecEndLabel.setValue('   - BNEC 停止年份: ' + bnec_end.toFixed(3));
+            } else {
+              bnecEndLabel.setValue('   - BNEC 停止年份: 数据不足');
+            }
+            if (typeof bnec_latest === 'number') {
+              bnecLatestLabel.setValue('   - BNEC 2023年: ' + bnec_latest.toFixed(3));
+            } else {
+              bnecLatestLabel.setValue('   - BNEC 2023年: 数据不足');
+            }
+
+            if (typeof bnec_start === 'number' && typeof bnec_end === 'number' && Math.abs(bnec_start) > 1e-6 && stopYearLabel !== null) {
+              var bnec_change_stop = (bnec_end - bnec_start) / Math.abs(bnec_start);
+              bnecChangeStopLabel.setValue('   - BNEC 变化率（' + startYearLabel + '-' + stopYearLabel + '）: ' + bnec_change_stop.toFixed(2));
+            } else if (stopYearLabel === null) {
+              bnecChangeStopLabel.setValue('   - BNEC 变化率（起始-停止）: 停止年份未识别');
+            } else {
+              bnecChangeStopLabel.setValue('   - BNEC 变化率（' + startYearLabel + '-' + stopYearLabel + '）: 无法计算');
+            }
+
+            if (typeof bnec_start === 'number' && typeof bnec_latest === 'number' && Math.abs(bnec_start) > 1e-6) {
+              var bnec_change_latest = (bnec_latest - bnec_start) / Math.abs(bnec_start);
+              bnecChangeLatestLabel.setValue('   - BNEC 变化率（' + startYearLabel + '-' + latestReferenceYear + '）: ' + bnec_change_latest.toFixed(2));
+            } else {
+              bnecChangeLatestLabel.setValue('   - BNEC 变化率（' + startYearLabel + '-' + latestReferenceYear + '）: 无法计算');
+            }
+          });
+        });
+      });
+    });
+  });
+};
+
+// ----------------------------- 绑定点击 -----------------------------
+Map.onClick(function(coords) {
+  tip.setValue('正在查询点击位置的矿区并分析...');
+  resultsPanel.clear();
+  resultsPanel.add(ui.Label('计算中...'));
+
+  var pt = ee.Geometry.Point([coords.lon, coords.lat]);
+  var subset = mineAreas.filterBounds(pt);
+
+  subset.size().evaluate(function(n) {
+    if (n > 0) {
+      analyzeMine(subset.first());
+      tip.setValue('分析完成！可点击下一个矿区。');
+    } else {
+      tip.setValue('未在此位置找到矿区，请点击黄色区域。');
+      resultsPanel.clear();
+    }
+  });
+});
