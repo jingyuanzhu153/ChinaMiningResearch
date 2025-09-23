@@ -1,1 +1,375 @@
-https://github.com/jingyuanzhu153/ChinaMiningResearch.git
+// ===================================================================================
+// 矿区生命周期分类与开采强度变化交互式分析工具
+// —— 修复：避免 ee.Algorithms.Not / IsEqual；用“mean+count”稳健判空
+// —— 稳健点：端点合成始终返回 ee.Image；统一缩放；BNNC/BNEC 直接返回数值
+// ===================================================================================
+
+// ----------------------------- 全局设置 -----------------------------
+var mineAreas = ee.FeatureCollection('users/Loki_ChinaMiningResearch/ChinaMiningPolygen');
+
+// MODIS NDVI（生命周期分类）
+var modisCollection = ee.ImageCollection('MODIS/061/MOD13Q1').select(['NDVI','SummaryQA']);
+
+// Sentinel-2（用于 2023 端点）
+var s2Raw = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var s2Collection = s2Raw.select(['B4','B8','SCL']); // 显式所需波段
+
+// Landsat L2（用于起始端点）
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .select(['SR_B4','SR_B5','QA_PIXEL'], ['RED','NIR','QA_PIXEL']);
+var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+  .select(['SR_B3','SR_B4','QA_PIXEL'], ['RED','NIR','QA_PIXEL']);
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .select(['SR_B3','SR_B4','QA_PIXEL'], ['RED','NIR','QA_PIXEL']);
+var mergedLandsatCollection = ee.ImageCollection(l5.merge(l7).merge(l8));
+
+// 地图可视
+Map.addLayer(mineAreas, {color: 'Yellow'}, '所有矿区');
+Map.centerObject(mineAreas.first(), 7);
+
+// ----------------------------- UI -----------------------------
+var mainPanel = ui.Panel({ style: { width: '420px', padding: '10px' } });
+ui.root.add(mainPanel);
+mainPanel.add(ui.Label({
+  value: '矿区生命周期与强度变化分析',
+  style: {fontWeight: 'bold', fontSize: '20px', margin: '0 0 10px 0'}
+}));
+var tip = ui.Label('请点击地图上的黄色矿区进行分析。');
+mainPanel.add(tip);
+var resultsPanel = ui.Panel();
+mainPanel.add(resultsPanel);
+
+// ----------------------------- 工具函数 -----------------------------
+// 云掩膜（适度，避免过严）
+var universalCloudMask = function(image, satellite) {
+  image = ee.Image(image);
+  if (satellite === 'Sentinel-2') {
+    // SCL: 排除云（8/9/10），保留 2/4/5/6/7/11
+    var keep = [2,4,5,6,7,11];
+    var mask = image.select('SCL').remap(keep, ee.List.repeat(1, keep.length), 0);
+    return image.updateMask(mask).select(['B4','B8']); // 返回B4/B8
+  } else {
+    var qa = image.select('QA_PIXEL');
+    var cloudShadow = 1 << 4;
+    var cloud = 1 << 3;
+    var mask = qa.bitwiseAnd(cloudShadow).eq(0).and(qa.bitwiseAnd(cloud).eq(0));
+    return image.updateMask(mask).select(['RED','NIR','QA_PIXEL']).select(['RED','NIR']);
+  }
+};
+
+// 合成：保证返回 ee.Image；不足则扩大时间窗；仍不足用“低掩膜”兜底
+var getComposite = function(year, satellite, collection, geom) {
+  var startDate = ee.Date.fromYMD(year - 2, 1, 1);
+  var endDate   = ee.Date.fromYMD(year + 2, 12, 31);
+  var selBands  = (satellite === 'Sentinel-2') ? ['B4','B8','SCL'] : ['RED','NIR','QA_PIXEL'];
+
+  var masked = collection.filterBounds(geom.buffer(10000)).filterDate(startDate, endDate)
+      .select(selBands)
+      .map(function(img){ return universalCloudMask(img, satellite); });
+
+  var wider = collection.filterBounds(geom.buffer(20000))
+      .filterDate(ee.Date.fromYMD(year - 3, 1, 1), ee.Date.fromYMD(year + 3, 12, 31))
+      .select(selBands)
+      .map(function(img){ return universalCloudMask(img, satellite); });
+
+  // 低掩膜兜底：只做时间筛选与波段选择，不做云掩膜
+  var loose = collection.filterBounds(geom.buffer(20000))
+      .filterDate(ee.Date.fromYMD(year - 3, 1, 1), ee.Date.fromYMD(year + 3, 12, 31))
+      .select(selBands)
+      .map(function(img){
+        return (satellite === 'Sentinel-2') ? ee.Image(img).select(['B4','B8'])
+                                            : ee.Image(img).select(['RED','NIR']);
+      });
+
+  var empty = (satellite === 'Sentinel-2')
+    ? ee.Image.constant([0,0]).rename(['B4','B8'])
+    : ee.Image.constant([0,0]).rename(['RED','NIR']);
+
+  var img = ee.Algorithms.If(
+    masked.size().gt(3), masked.mean().select(empty.bandNames()),
+    ee.Algorithms.If(
+      wider.size().gt(3), wider.mean().select(empty.bandNames()),
+      ee.Algorithms.If(
+        loose.size().gt(1), loose.mean().select(empty.bandNames()),
+        empty
+      )
+    )
+  );
+  return ee.Image(img).clip(geom.buffer(12000));
+};
+
+// 缩放：L2/S2 → 反射率(0..1)
+var scaleBands = function(img, satellite) {
+  img = ee.Image(img);
+  if (satellite === 'Sentinel-2') {
+    return ee.Image.cat([
+      img.select(0).multiply(0.0001).rename('RED'),
+      img.select(1).multiply(0.0001).rename('NIR')
+    ]);
+  } else {
+    // reflectance = DN*0.0000275 - 0.2
+    return ee.Image.cat([
+      img.select(0).multiply(0.0000275).add(-0.2).rename('RED'),
+      img.select(1).multiply(0.0000275).add(-0.2).rename('NIR')
+    ]);
+  }
+};
+
+// 单区稳健均值：优先“掩膜后的 mean+count”，count=0 时回退到 unmask(0) 的均值
+var robustMean = function(img, bandName, geom, scale) {
+  var reducer = ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.count(), sharedInputs: true
+  });
+  var statsMasked = ee.Dictionary(
+    ee.Image(img.select(bandName)).reduceRegion({
+      reducer: reducer, geometry: geom, scale: scale, maxPixels: 1e9, bestEffort: true
+    })
+  );
+  var meanMasked = ee.Number(statsMasked.get(bandName + '_mean'));
+  var countMasked = ee.Number(statsMasked.get(bandName + '_count'));
+  var meanLoose = ee.Number(
+    ee.Image(img.select(bandName)).unmask(0).reduceRegion({
+      reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e9, bestEffort: true
+    }).get(bandName)
+  );
+  return ee.Number(ee.Algorithms.If(countMasked.gt(0), meanMasked, meanLoose));
+};
+
+// 计算 BNNC/BNEC —— 直接返回数值
+var calcBNNC_BNEC = function(image, satellite, geom, ring) {
+  var scale = (satellite === 'Sentinel-2' ? 10 : 30);
+  var scaled = scaleBands(image, satellite);
+  var RED = scaled.select('RED');
+  var NIR = scaled.select('NIR');
+
+  // NDVI
+  var ndvi = NIR.subtract(RED).divide(NIR.add(RED).add(1e-6)).rename('NDVI');
+
+  // BNNC：内/环 NDVI 均值（掩膜count=0回退到unmask(0)）
+  var ndvi_in  = robustMean(ndvi, 'NDVI', geom, scale);
+  var ndvi_out = robustMean(ndvi, 'NDVI', ring, scale);
+  var bnnc = ee.Number(ee.Algorithms.If(ndvi_out.abs().gt(1e-12),
+              ndvi_out.subtract(ndvi_in).divide(ndvi_out), null));
+
+  // BNEC：NIR 纹理熵（GLCM），同样用稳健均值
+  var nirByte = NIR.clamp(0,1).multiply(255).toByte();
+  var texture = nirByte.glcmTexture({size: 2, average: true});
+  var entropy = texture.select('NIR_entropy'); // 标准命名
+
+  var ent_in  = robustMean(entropy, 'NIR_entropy', geom, scale);
+  var ent_out = robustMean(entropy, 'NIR_entropy', ring, scale);
+  var bnec = ee.Number(ee.Algorithms.If(ent_out.abs().gt(1e-12),
+              ent_out.subtract(ent_in).divide(ent_out), null));
+
+  return ee.Dictionary({
+    bnnc_in: ndvi_in, bnnc_out: ndvi_out, bnnc: bnnc,
+    bnec_in: ent_in,  bnec_out: ent_out,  bnec: bnec
+  });
+};
+
+// ----------------------------- 主分析流程 -----------------------------
+var analyzeMine = function(selectedMine) {
+  selectedMine = ee.Feature(selectedMine);
+
+  // 高亮
+  var toRemove = [];
+  for (var i = 0; i < Map.layers().length(); i++) {
+    var lyr = Map.layers().get(i);
+    if (lyr.getName() === '选中的矿区') toRemove.push(lyr);
+  }
+  toRemove.forEach(function(lyr){ Map.remove(lyr); });
+  Map.addLayer(selectedMine, {color: 'Red'}, '选中的矿区');
+
+  var geom = selectedMine.geometry().simplify(100);
+
+  // UI
+  resultsPanel.clear();
+  var classificationLabel = ui.Label('1. 正在进行生命周期分类...');
+  var chartPanel = ui.Panel();
+  var intensityPanel = ui.Panel();
+  resultsPanel.add(classificationLabel).add(chartPanel).add(intensityPanel);
+
+  // 生命周期分类（MODIS 年均NDVI）
+  var maskMODIS = function(image) {
+    return image.updateMask(image.select('SummaryQA').lte(1));
+  };
+  var maskedModisCollection = modisCollection.filterDate('2000-01-01', '2023-12-31').map(maskMODIS);
+
+  var years = ee.List.sequence(2000, 2023);
+  var annualNdvi = ee.FeatureCollection(years.map(function(year) {
+    var annualMean = maskedModisCollection.filter(ee.Filter.calendarRange(year, year, 'year'))
+      .select('NDVI').mean().multiply(0.0001)
+      .reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: geom,
+        scale: 250,
+        maxPixels: 1e9
+      }).get('NDVI');
+    return ee.Feature(null, {'year': year, 'annual_mean_ndvi': annualMean});
+  })).filter(ee.Filter.notNull(['annual_mean_ndvi']));
+
+  annualNdvi.evaluate(function(fc, error) {
+    if (error || !fc || fc.features.length < 5) {
+      resultsPanel.clear();
+      resultsPanel.add(ui.Label('数据不足或计算错误，无法进行分析。'));
+      return;
+    }
+
+    var data = fc.features.map(function(f) {
+      return { year: f.properties.year, ndvi: f.properties.annual_mean_ndvi };
+    }).sort(function(a, b) { return a.year - b.year; });
+
+    // 简单分类
+    var category = 'C (扰动轻微或模式复杂)';
+    var startYearVal = null;
+    for (var i = 2; i < data.length - 2; i++) {
+      var isPeak = data[i].ndvi > data[i-1].ndvi && data[i].ndvi > data[i+1].ndvi;
+      if (isPeak && data[i].year < 2020 && (data[i].ndvi - data[i+2].ndvi > 0.01)) {
+        startYearVal = data[i].year;
+        category = 'B (本世纪活跃矿区)';
+        break;
+      }
+    }
+    var initialNdvi = (data[0].ndvi + data[1].ndvi + data[2].ndvi) / 3;
+    if (category !== 'B (本世纪活跃矿区)' && initialNdvi < 0.15) {
+      category = 'A (历史遗留矿区)';
+    }
+
+    classificationLabel.setValue('1. 生命周期分类结果: ' + category);
+
+    var dataTable = [['Year', 'NDVI']];
+    data.forEach(function(d) { dataTable.push([String(d.year), d.ndvi]); });
+    var ndviChart = ui.Chart(dataTable, 'LineChart', {
+      title: 'NDVI 历史趋势 (2000-2023)',
+      hAxis: {title: '年份', format: '####'}, vAxis: {title: '年平均NDVI'},
+      lineWidth: 2, pointSize: 4, series: { 0: {color: 'green'} }
+    });
+    chartPanel.clear(); chartPanel.add(ndviChart);
+
+    // 强度变化（仅 B 类执行）
+    if (category === 'B (本世纪活跃矿区)') {
+      intensityPanel.clear();
+      intensityPanel.add(ui.Label('2. 开采强度变化分析', {fontWeight: 'bold'}));
+      intensityPanel.add(ui.Label('   开采起始年份 (基准): ' + startYearVal, {whiteSpace: 'pre'}));
+
+      var bnncStartLabel = ui.Label('   - BNNC 起始年份: 正在计算...', {whiteSpace: 'pre'});
+      var bnncEndLabel   = ui.Label('   - BNNC 2023年份: 正在计算...', {whiteSpace: 'pre'});
+      var bnncChangeLabel= ui.Label('   - BNNC 变化率: 正在计算...', {whiteSpace: 'pre'});
+      intensityPanel.add(bnncStartLabel).add(bnncEndLabel).add(bnncChangeLabel);
+
+      var bnecStartLabel = ui.Label('   - BNEC 起始年份: 正在计算...', {whiteSpace: 'pre'});
+      var bnecEndLabel   = ui.Label('   - BNEC 2023年份: 正在计算...', {whiteSpace: 'pre'});
+      var bnecChangeLabel= ui.Label('   - BNEC 变化率: 正在计算...', {whiteSpace: 'pre'});
+      intensityPanel.add(bnecStartLabel).add(bnecEndLabel).add(bnecChangeLabel);
+
+      var endYearVal = 2023;
+      var ring = geom.buffer(1000).difference(geom, 10);
+
+      // 可用性（影像张数）
+      var checkAvail = function(year, satellite, collection) {
+        var startDate = ee.Date.fromYMD(year - 2, 1, 1);
+        var endDate   = ee.Date.fromYMD(year + 2, 12, 31);
+        return collection.filterBounds(geom.buffer(10000)).filterDate(startDate, endDate).size();
+      };
+      var startCount = checkAvail(startYearVal, 'Landsat', mergedLandsatCollection);
+      var endCount   = checkAvail(endYearVal,   'Sentinel-2', s2Collection);
+
+      intensityPanel.add(ui.Label('   数据可用性检查:', {fontWeight: 'bold', whiteSpace: 'pre'}));
+      var startDataLabel = ui.Label('   - 起始年份 (' + startYearVal + ') Landsat影像数量: 正在检查...', {whiteSpace: 'pre'});
+      var endDataLabel   = ui.Label('   - 结束年份 (' + endYearVal   + ') Sentinel-2影像数量: 正在检查...', {whiteSpace: 'pre'});
+      intensityPanel.add(startDataLabel).add(endDataLabel);
+
+      startCount.evaluate(function(sc){
+        startDataLabel.setValue('   - 起始年份 (' + startYearVal + ') Landsat影像数量: ' + sc);
+        endCount.evaluate(function(ec){
+          endDataLabel.setValue('   - 结束年份 (' + endYearVal + ') Sentinel-2影像数量: ' + ec);
+
+          if (sc < 1 || ec < 1) {
+            intensityPanel.add(ui.Label('   数据极少，结果可能不稳定。', {color: 'orange'}));
+          }
+
+          // 合成端点影像
+          var startComposite = getComposite(startYearVal, 'Landsat',   mergedLandsatCollection, geom);
+          var endComposite   = getComposite(endYearVal,   'Sentinel-2', s2Collection,           geom);
+
+          // 计算指标（直接返回数值）
+          var startDict = calcBNNC_BNEC(startComposite, 'Landsat',   geom, ring);
+          var endDict   = calcBNNC_BNEC(endComposite,   'Sentinel-2', geom, ring);
+
+          ee.Dictionary({start: startDict, end: endDict}).evaluate(function(results, err){
+            if (err) {
+              intensityPanel.add(ui.Label('   计算错误: ' + err, {color: 'red'}));
+              return;
+            }
+            if (!results || !results.start || !results.end) {
+              intensityPanel.add(ui.Label('   结果为空。', {color: 'red'}));
+              return;
+            }
+
+            var bnnc_start = results.start.bnnc;
+            var bnnc_end   = results.end.bnnc;
+            var bnec_start = results.start.bnec;
+            var bnec_end   = results.end.bnec;
+
+            // BNNC
+            if (typeof bnnc_start === 'number') {
+              bnncStartLabel.setValue('   - BNNC 起始年份: ' + bnnc_start.toFixed(3));
+            } else {
+              bnncStartLabel.setValue('   - BNNC 起始年份: 数据不足');
+            }
+            if (typeof bnnc_end === 'number') {
+              bnncEndLabel.setValue('   - BNNC 2023年份: ' + bnnc_end.toFixed(3));
+            } else {
+              bnncEndLabel.setValue('   - BNNC 2023年份: 数据不足');
+            }
+            if (typeof bnnc_start === 'number' && typeof bnnc_end === 'number' && Math.abs(bnnc_start) > 1e-6) {
+              var bnnc_change = (bnnc_end - bnnc_start) / Math.abs(bnnc_start);
+              bnncChangeLabel.setValue('   - BNNC 变化率: ' + bnnc_change.toFixed(2));
+            } else {
+              bnncChangeLabel.setValue('   - BNNC 变化率: 无法计算');
+            }
+
+            // BNEC
+            if (typeof bnec_start === 'number') {
+              bnecStartLabel.setValue('   - BNEC 起始年份: ' + bnec_start.toFixed(3));
+            } else {
+              bnecStartLabel.setValue('   - BNEC 起始年份: 数据不足');
+            }
+            if (typeof bnec_end === 'number') {
+              bnecEndLabel.setValue('   - BNEC 2023年份: ' + bnec_end.toFixed(3));
+            } else {
+              bnecEndLabel.setValue('   - BNEC 2023年份: 数据不足');
+            }
+            if (typeof bnec_start === 'number' && typeof bnec_end === 'number' && Math.abs(bnec_start) > 1e-6) {
+              var bnec_change = (bnec_end - bnec_start) / Math.abs(bnec_start);
+              bnecChangeLabel.setValue('   - BNEC 变化率: ' + bnec_change.toFixed(2));
+            } else {
+              bnecChangeLabel.setValue('   - BNEC 变化率: 无法计算');
+            }
+          });
+        });
+      });
+    }
+  });
+};
+
+// ----------------------------- 绑定点击 -----------------------------
+Map.onClick(function(coords){
+  tip.setValue('正在查询点击位置的矿区并分析...');
+  resultsPanel.clear();
+  resultsPanel.add(ui.Label('计算中...'));
+
+  var pt = ee.Geometry.Point([coords.lon, coords.lat]);
+  var subset = mineAreas.filterBounds(pt);
+
+  subset.size().evaluate(function(n){
+    if (n > 0){
+      analyzeMine(subset.first());
+      tip.setValue('分析完成！可点击下一个矿区。');
+    } else {
+      tip.setValue('未在此位置找到矿区，请点击黄色区域。');
+      resultsPanel.clear();
+    }
+  });
+});
+
